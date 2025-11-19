@@ -394,82 +394,6 @@ function computeTokenOffsets(tokens) {
   return offsets;
 }
 
-function isEmojiCodePoint(cp) {
-  if (typeof cp !== 'number' || !Number.isFinite(cp)) return false;
-  return (
-    (cp >= 0x1f300 && cp <= 0x1faff) ||
-    (cp >= 0x1f1e6 && cp <= 0x1f1ff) ||
-    (cp >= 0x2600 && cp <= 0x26ff) ||
-    (cp >= 0x2700 && cp <= 0x27bf) ||
-    (cp >= 0x1f3fb && cp <= 0x1f3ff) ||
-    cp === 0xfe0e ||
-    cp === 0xfe0f
-  );
-}
-
-function stripEmoji(text) {
-  if (typeof text !== 'string' || text.length === 0) return '';
-  let out = '';
-  let i = 0;
-  while (i < text.length) {
-    const cp = text.codePointAt(i);
-    const ch = String.fromCodePoint(cp);
-    const cpLen = ch.length;
-    if (!isEmojiCodePoint(cp)) {
-      out += ch;
-    }
-    i += cpLen;
-  }
-  return out;
-}
-
-function buildEmojiStrippedWithMap(text) {
-  const noEmojiChars = [];
-  const mapOutToOriginal = [];
-  if (typeof text !== 'string' || text.length === 0) {
-    return { stripped: '', mapOutToOriginal };
-  }
-  let i = 0;
-  while (i < text.length) {
-    const cp = text.codePointAt(i);
-    const ch = String.fromCodePoint(cp);
-    const cpLen = ch.length;
-    if (!isEmojiCodePoint(cp)) {
-      mapOutToOriginal[noEmojiChars.length] = i;
-      noEmojiChars.push(ch);
-    }
-    i += cpLen;
-  }
-  return { stripped: noEmojiChars.join(''), mapOutToOriginal };
-}
-
-function findEmojiInsensitiveMatch(fileText, oldText) {
-  if (typeof fileText !== 'string' || typeof oldText !== 'string') return null;
-  const oldStripped = stripEmoji(oldText);
-  if (!oldStripped) return null;
-  const { stripped: fileStripped, mapOutToOriginal } =
-    buildEmojiStrippedWithMap(fileText);
-  if (!fileStripped) return null;
-  const idx = fileStripped.indexOf(oldStripped);
-  if (idx === -1) return null;
-  const startChar = mapOutToOriginal[idx];
-  if (typeof startChar !== 'number') return null;
-  let remaining = oldStripped.length;
-  let current = startChar;
-  while (current < fileText.length && remaining > 0) {
-    const cp = fileText.codePointAt(current);
-    const ch = String.fromCodePoint(cp);
-    const cpLen = ch.length;
-    if (!isEmojiCodePoint(cp)) {
-      remaining -= 1;
-    }
-    current += cpLen;
-  }
-  const endChar = current;
-  if (endChar <= startChar) return null;
-  return { startChar, endChar };
-}
-
 async function applyEditFileInfiniteFlex(context) {
   if (!context || context.toolName !== 'edit_file') return context;
 
@@ -514,27 +438,8 @@ async function applyEditFileInfiniteFlex(context) {
       return;
     }
 
-    let matchIndex = findTokenMatchInfiniteFlex(fileTokens, oldTokens);
-
+    const matchIndex = findTokenMatchInfiniteFlex(fileTokens, oldTokens);
     if (matchIndex === -1) {
-      const emojiMatch = findEmojiInsensitiveMatch(fileText, e.oldText);
-      if (emojiMatch) {
-        const { startChar, endChar } = emojiMatch;
-        const canonicalOldText = fileText.slice(startChar, endChar);
-        if (canonicalOldText !== e.oldText) {
-          summaryRecords.push({
-            editIndex: index,
-            originalLength: e.oldText.length,
-            canonicalLength: canonicalOldText.length,
-            matchIndex: -1,
-            reason: 'emoji-flex-fallback',
-          });
-          e.oldText = canonicalOldText;
-        }
-        updatedEdits.push(e);
-        return;
-      }
-
       updatedEdits.push(e);
       return;
     }
@@ -852,8 +757,7 @@ async function createStage2Backup(filePath, kind) {
   try {
     const stat = await fs.promises.stat(filePath);
     if (!stat || !stat.isFile()) {
-      // No original file exists (e.g., first write to a new path)
-      return { backupPath: null, mode: 'no-original' };
+      return null;
     }
     const dir = path.dirname(filePath);
     const base = path.basename(filePath);
@@ -862,14 +766,10 @@ async function createStage2Backup(filePath, kind) {
     const backupName = `${base}.stage2-backup-${kind || 'unknown'}-${stamp}-${rand}`;
     const backupPath = path.join(dir, backupName);
     await fs.promises.copyFile(filePath, backupPath);
-    return { backupPath, mode: 'normal' };
+    return backupPath;
   } catch (e) {
-    if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) {
-      // No original file exists
-      return { backupPath: null, mode: 'no-original' };
-    }
     console.error('stage2 backup creation failed:', e);
-    return { backupPath: null, mode: 'error' };
+    return null;
   }
 }
 
@@ -983,23 +883,13 @@ async function validateStructuredFile(filePath, kind) {
                 (stderr && String(stderr).trim()) ||
                 (error && error.message) ||
                 String(error);
-
-              // If Python is not available on PATH, treat this as a hard
-              // failure for Stage 2. We do NOT allow validation to pass when
-              // the validator is missing.
+              
+              // If Python is not available on PATH, treat as validator unavailable
               if (error.code === 'ENOENT') {
                 console.error('stage2 python validator unavailable:', rawError);
-                const msg =
-                  'Python validator (py_compile) is not available on PATH. ' +
-                  'Stage 2 cannot validate this Python file; the edit has been blocked.\n\n' +
-                  `Raw error: ${rawError}`;
-                return resolve({
-                  ok: false,
-                  error: msg,
-                  validatorUnavailable: true,
-                });
+                return resolve({ ok: true, validatorUnavailable: true });
               }
-
+              
               // Enhanced Python error with bidirectional escape-sequence context
               const enhancedMsg =
                 'Python syntax validation error:\n' +
@@ -1017,12 +907,8 @@ async function validateStructuredFile(filePath, kind) {
                 'Either direction can break Python syntax when these transformations occur inside string literals, docstrings, or other contexts where the distinction matters.\n\n' +
                 'The Python compiler output above provides specific hints about what broke and where.\n\n' +
                 'SOLUTION: Restore from the backup and retry your edit, paying close attention to how newlines, quotes, and other special characters are represented in your newText argument.';
-
-              return resolve({
-                ok: false,
-                error: enhancedMsg,
-                enhancedDiagnostic: 'python-syntax-error',
-              });
+              
+              return resolve({ ok: false, error: enhancedMsg, enhancedDiagnostic: 'python-syntax-error' });
             }
             return resolve({ ok: true });
           },
@@ -1067,7 +953,7 @@ async function validateStructuredFile(filePath, kind) {
   }
 }
 
-async function runStructuredFileWithStage2Guard(clientEntry, context) {
+async function runEditFileWithStage2Guard(clientEntry, context) {
   const args = context.toolArgs || {};
   const filePath = args.path;
   const kind = getStructuredFileKind(filePath);
@@ -1087,13 +973,23 @@ async function runStructuredFileWithStage2Guard(clientEntry, context) {
     );
   }
 
-  const backupInfo = await createStage2Backup(filePath, kind);
-  const backupPath = backupInfo && backupInfo.backupPath;
-
-  if (backupInfo && backupInfo.mode === 'error') {
+  const backupPath = await createStage2Backup(filePath, kind);
+  if (!backupPath) {
+    // If backup can't be created, fail open: run the edit without Stage 2 validation.
     console.error(
-      'stage2: unable to create backup before structured file edit; proceeding without backup for',
+      'stage2: unable to create backup before edit_file; skipping guardian validation for',
       filePath,
+    );
+    return clientEntry.client.callTool(
+      {
+        name: context.toolName,
+        arguments: context.toolArgs,
+      },
+      undefined,
+      {
+        timeout: 900000,
+        resetTimeoutOnProgress: true,
+      },
     );
   }
 
@@ -1111,39 +1007,27 @@ async function runStructuredFileWithStage2Guard(clientEntry, context) {
       },
     );
   } catch (error) {
-    // Underlying tool call failed; bubble the error unchanged.
+    // Underlying edit_file failed; bubble the error unchanged.
     throw error;
   }
 
   const validation = await validateStructuredFile(filePath, kind);
   if (validation && validation.ok) {
-    // On success, clean up the backup file (if any) and return the original result
-    if (backupPath) {
-      try {
-        await fs.promises.unlink(backupPath);
-      } catch (e) {
-        console.error(`stage2: failed to clean up backup file ${backupPath}`, e);
-      }
-    }
     return toolResult;
   }
 
   const errorMessage =
     (validation && validation.error) || 'Unknown structural validation error';
 
-  const backupLine = backupPath
-    ? `Pre-edit backup: ${backupPath}`
-    : 'Pre-edit backup: (none - file was created by this operation; no prior version exists.)';
-
   const lines = [
-    `Stage 2 guardian validation FAILED for ${kind.toUpperCase()} file after ${context.toolName}.`,
+    `Stage 2 guardian validation FAILED for ${kind.toUpperCase()} file after edit_file.`,
     '',
     `Path: ${filePath}`,
-    backupLine,
+    `Pre-edit backup: ${backupPath}`,
     '',
     `Validator error: ${errorMessage}`,
     '',
-    'The file has been left in its post-edit state. Use the backup information above to inspect or restore.',
+    'The file has been left in its post-edit state. Use the backup path above to inspect or restore.',
   ];
 
   return {
@@ -1167,221 +1051,7 @@ async function runStructuredFileWithStage2Guard(clientEntry, context) {
 /**
  * Determine if a PowerShell run_command invocation is in the small
  * safe-operations whitelist (SNAPNAX, Obsidian/PARALLAX, Araxis).
- *
- * This section also contains the run_command cleansing framework:
- *  - We can transform known-good but fragile commands (Araxis, SNAPNAX, Obsidian, etc.)
- *  - We log every transformation to a dedicated log for later inspection
- *  - Future cleansers can be added without touching the HTTP routes.
  */
-
-// Log for all run_command cleansing activity (including no-op detections)
-const RUN_COMMAND_CLEANSE_LOG =
-  'E\\\\__daniel347x\\\\__Obsidian\\\\__Inking into Mind\\\\--TypingMind\\\\Projects - All\\\\Projects - Individual\\\\TODO\\\\temp\\\\run_command_cleanse.log';
-
-function logRunCommandCleanse(entry) {
-  try {
-    const payload = {
-      timestamp: new Date().toISOString(),
-      marker: 'run_command_cleansing_v1',
-      ...entry,
-    };
-    fs.appendFile(
-      RUN_COMMAND_CLEANSE_LOG,
-      JSON.stringify(payload) + '\n',
-      () => {},
-    );
-  } catch (e) {
-    console.error('run_command cleanse log failure:', e);
-  }
-}
-
-/**
- * Very lightweight parser that finds quoted Windows paths of the form:
- *   "<drive>:\\...\\something.ext"
- * where the path is immediately preceded by one of ", ', or `.
- *
- * This is intentionally conservative and only used for cleansing helpers.
- */
-function findQuotedWindowsPathsInCommand(cmd) {
-  const results = [];
-  if (!cmd || typeof cmd !== 'string') return results;
-
-  const len = cmd.length;
-  for (let i = 0; i < len - 3; i += 1) {
-    const delim = cmd[i];
-    if (delim !== '"' && delim !== "'" && delim !== '`') continue;
-    const drive = cmd[i + 1];
-    if (!/[A-Za-z]/.test(drive)) continue;
-    if (cmd[i + 2] !== ':' || cmd[i + 3] !== '\\') continue;
-
-    const start = i + 1; // start of path (after the quote/backtick)
-    let j = start;
-    while (j < len && cmd[j] !== delim) {
-      j += 1;
-    }
-    if (j >= len) break; // unmatched delimiter, bail out
-
-    const pathText = cmd.slice(start, j);
-    results.push({
-      path: pathText,
-      start,
-      end: j,
-      delim,
-    });
-    i = j; // skip past this path
-  }
-
-  return results;
-}
-
-/**
- * Build a canonical Araxis Merge PowerShell command that is robust
- * against spaces in file paths.
- *
- * NOTE: This intentionally uses a simpler -ArgumentList @('left','right')
- * form instead of reusing whatever the agent provided. The goal is to
- * give Araxis exactly two string arguments (left file, right file) with
- * safe quoting.
- */
-function buildAraxisCommand(leftPath, rightPath) {
-  if (!leftPath || !rightPath) return null;
-
-  const araxisExe =
-    'C:\\Users\\danie\\AppData\\Local\\Apps\\Araxis\\Araxis Merge\\Merge.exe';
-
-  // Escape single quotes inside paths for PowerShell single-quoted strings.
-  const escapeSingleQuotes = (p) => String(p).replace(/'/g, "''");
-
-  const p1 = escapeSingleQuotes(leftPath);
-  const p2 = escapeSingleQuotes(rightPath);
-
-  const inner =
-    `Start-Process -FilePath '${araxisExe}' -ArgumentList @('${p1}','${p2}')`;
-
-  // We deliberately avoid double quotes inside `inner` so the outer
-  // -Command "..." wrapper is stable.
-  return `powershell.exe -Command "${inner}"`;
-}
-
-/**
- * Detect and transform Araxis Merge PowerShell invocations that were
- * generated with fragile escaping. If we can confidently extract two
- * .md paths, we rebuild the command with a known-good quoting pattern.
- */
-function transformAraxisCommand(rawCommand) {
-  if (!rawCommand || typeof rawCommand !== 'string') {
-    return { changed: false, command: rawCommand };
-  }
-
-  const lower = rawCommand.toLowerCase();
-  const looksLikeAraxis =
-    lower.includes('start-process') &&
-    lower.includes('araxis merge\\merge.exe') &&
-    lower.includes('-argumentlist');
-
-  if (!looksLikeAraxis) {
-    return { changed: false, command: rawCommand };
-  }
-
-  const quotedPaths = findQuotedWindowsPathsInCommand(rawCommand);
-
-  // Filter for Markdown files only (.md or .original.md) so we skip the .exe path.
-  const mdPaths = quotedPaths
-    .map((q) => q.path)
-    .filter((p) => /\.md$/i.test(p) || /\.original\.md$/i.test(p));
-
-  if (mdPaths.length < 2) {
-    logRunCommandCleanse({
-      kind: 'araxis-detect-failed',
-      originalCommand: rawCommand,
-      reason: 'could-not-find-two-md-paths',
-      discoveredPaths: quotedPaths,
-    });
-    return { changed: false, command: rawCommand };
-  }
-
-  const leftPath = mdPaths[mdPaths.length - 2];
-  const rightPath = mdPaths[mdPaths.length - 1];
-
-  // Optional safety: only transform if both target files actually exist.
-  let leftExists = false;
-  let rightExists = false;
-  try {
-    leftExists = fs.existsSync(leftPath);
-    rightExists = fs.existsSync(rightPath);
-  } catch (e) {
-    console.error('Araxis path existence check failed:', e);
-  }
-
-  if (!leftExists || !rightExists) {
-    logRunCommandCleanse({
-      kind: 'araxis-paths-missing',
-      originalCommand: rawCommand,
-      leftPath,
-      rightPath,
-      leftExists,
-      rightExists,
-    });
-    return { changed: false, command: rawCommand };
-  }
-
-  const rebuilt = buildAraxisCommand(leftPath, rightPath);
-  if (!rebuilt) {
-    logRunCommandCleanse({
-      kind: 'araxis-build-failed',
-      originalCommand: rawCommand,
-      leftPath,
-      rightPath,
-    });
-    return { changed: false, command: rawCommand };
-  }
-
-  if (rebuilt === rawCommand) {
-    // Nothing actually changed – no need to log noisy entries.
-    return { changed: false, command: rawCommand };
-  }
-
-  logRunCommandCleanse({
-    kind: 'araxis-transformed',
-    originalCommand: rawCommand,
-    transformedCommand: rebuilt,
-    leftPath,
-    rightPath,
-  });
-
-  return { changed: true, command: rebuilt };
-}
-
-/**
- * Apply all known cleansing transforms to run_command arguments.
- * Returns either the original args or a shallow-cloned copy with
- * `command` rewritten.
- */
-function cleanseRunCommandArgs(toolArgs) {
-  if (!toolArgs || typeof toolArgs.command !== 'string') {
-    return toolArgs || {};
-  }
-
-  let command = toolArgs.command;
-  let changed = false;
-
-  // 1) Araxis Merge command fixer
-  const araxis = transformAraxisCommand(command);
-  if (araxis.changed) {
-    command = araxis.command;
-    changed = true;
-  }
-
-  if (!changed) {
-    return toolArgs;
-  }
-
-  return {
-    ...toolArgs,
-    command,
-  };
-}
-
 function isSafePowerShellCommand(rawCommand) {
   if (!rawCommand || typeof rawCommand !== 'string') {
     return false;
@@ -1438,7 +1108,7 @@ async function dispatchToolCall(clientEntry, toolName, toolArgs) {
   // Stage 2 guardian: for edit_file and write_file on structurally constrained files,
   // wrap the underlying call with per-edit backup + post-call validation.
   if (context.toolName === 'edit_file' || context.toolName === 'write_file') {
-    return runStructuredFileWithStage2Guard(clientEntry, context);
+    return runEditFileWithStage2Guard(clientEntry, context);
   }
 
   // Default behaviour: forward directly to the underlying MCP client
@@ -1749,8 +1419,7 @@ async function start(authToken) {
   // Call a tool for a specific client
   app.post('/clients/:id/call_tools', auth, async (req, res) => {
     const { id } = req.params;
-    const { name } = req.body;
-    let toolArgs = req.body.arguments || {};
+    const { name, arguments: toolArgs } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Tool name is required' });
@@ -1759,11 +1428,6 @@ async function start(authToken) {
     const clientEntry = clients.get(id);
     if (!clientEntry) {
       return res.status(404).json({ error: 'Client not found' });
-    }
-
-    // Allow a cleansing pass for run_command before PowerShell guardrails run.
-    if (name === 'run_command') {
-      toolArgs = cleanseRunCommandArgs(toolArgs);
     }
 
     // 🚫 PowerShell guardrail: block general PowerShell, allow only a small safe whitelist
